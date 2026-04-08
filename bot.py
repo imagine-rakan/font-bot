@@ -102,7 +102,7 @@ def init_db():
 
 
         # --- إضافة الجداول للميزة الجديدة ---
-        anti_designer.init_db(DB)
+        anti_designer.init_db(conn)
 
         conn.commit()
     
