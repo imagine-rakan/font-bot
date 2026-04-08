@@ -25,12 +25,9 @@ from telegram.constants import ChatMemberStatus
 from telegram import ChatMemberUpdated, ChatMember, Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler,
-    CallbackQueryHandler, MessageHandler, ChatMemberHandler, filters,
-    InlineQueryHandler
+    CallbackQueryHandler, MessageHandler, ChatMemberHandler, filters
 )
-
-from admin_filter import delete_admin_chars, promote_user, demote_user
-from whisper import handle_whisper, whisper_callback, inline_whisper
+import anti_designer
 PANEL_SESSIONS = {}   # user_id -> chat_id الذي جاء منه
 # ==== إصلاح ترميز ويندوز ====
 sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -103,6 +100,10 @@ def init_db():
             "INSERT OR IGNORE INTO settings VALUES ('delete_admin_trigger', '1')"
         )
 
+
+        # --- إضافة الجداول للميزة الجديدة ---
+        anti_designer.init_db(DB)
+
         conn.commit()
     
 def is_bot_enabled() -> bool:
@@ -161,24 +162,16 @@ async def is_admin_in_chat(user_id: int, chat_id: int, context):
     if user_id == OWNER_ID:
         return True
 
-    # فحص مشرفين تليجرام الأساسيين
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
-        if member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
-            return True
+
+        return member.status in (
+            ChatMemberStatus.OWNER,
+            ChatMemberStatus.ADMINISTRATOR
+        )
+
     except Exception:
-        pass
-        
-    # فحص مشرفين البوت من الداتا بيز (التعديل الجديد)
-    try:
-        with sqlite3.connect(DB) as conn:
-            cur = conn.execute("SELECT user_id FROM admins WHERE user_id=?", (user_id,))
-            if cur.fetchone():
-                return True
-    except Exception:
-        pass
-        
-    return False
+        return False
 
 # ==== كاش ====
 REPLIES = {}
@@ -316,6 +309,7 @@ def panel_keyboard():
     )
 
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 منع ترويج الأسماء", callback_data="anti_designer_menu")], # 👈 الزر الجديد الخاص بالميزة
         [toggle_bot_btn],
         [delete_admin_btn],
         [InlineKeyboardButton("🔄 تحديث المشرفين", callback_data="refresh_admins")],
@@ -664,23 +658,53 @@ async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.warning("Failed to delete admin message: %s", e)
 
 
-# ==== معالج الرسائل (محدّث) ====
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     message = update.message
-    if user_id in PENDING_ADD:
-        # اسمح فقط بالخاص أثناء الإضافة
-        if update.effective_chat.type != "private":
-            return
     if not message:
         return
+
+    # --- 1. فحص إعداد رسالة منع المصممين في الخاص ---
+    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_anti_designer_msg":
+        if update.effective_chat.type != "private":
+            return
+        await anti_designer.save_message(message, DB)
+        PENDING_ADD.pop(user_id, None)
+        await message.reply_text("✅ تم حفظ رسالة الحذف بنجاح!\n(تتضمن جميع التنسيقات والإيموجيات)")
+        return
+    # ------------------------------------------------
+
+
+
+    # --- استقبال الكلمة الممنوعة الجديدة في الخاص ---
+    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_anti_designer_kw":
+        if update.effective_chat.type != "private" or not update.message.text:
+            return
+        
+        new_kw = update.message.text.strip()
+        anti_designer.add_keyword(DB, new_kw)
+        PENDING_ADD.pop(user_id, None)
+        await update.message.reply_text(f"✅ تم إضافة كلمة «{new_kw}» لقائمة المنع بنجاح.")
+        return
+    
+
+
+    # (باقي الكود الخاص بك يظل كما هو، إلى أن نصل لفحص القروب)
 
     # 🔴 البوت متوقف
     if not is_bot_enabled():
         if not await is_admin_in_chat(user_id, message.chat.id, context):
             return
-    if not message:
-        return
+
+    # --- 2. هوك فحص الأسماء في القروبات (القلب النابض للميزة) ---
+    if message.chat.type in ("group", "supergroup"):
+        is_admin = await is_admin_in_chat(user_id, message.chat.id, context)
+        # إذا رجعت الدالة بـ True، هذا يعني أنه تم مسح الرسالة، فنقوم بإنهاء الدالة
+        if await anti_designer.process_message(update, context, is_admin, DB):
+            return
+    # -----------------------------------------------------------
+
+    # (باقي أكواد إضافة الردود والرد التلقائي كما هي تماماً)
 
     # =========================
     # 🔍 استقبال نص البحث
@@ -904,10 +928,75 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
+    data = query.data
+
     # ⏸ البوت متوقف
     if not is_bot_enabled() and data != "bot_on":
         await query.message.reply_text("⏸ البوت متوقف حالياً.")
         return
+
+    # ===============================
+    # التحكم بميزة منع المصممين (التعديل رقم 5)
+    # ===============================
+    if data == "panel_main":
+        await query.message.edit_reply_markup(panel_keyboard())
+        return
+
+    if data == "anti_designer_menu":
+        await query.message.edit_reply_markup(anti_designer.get_sub_menu(DB))
+        return
+
+    if data == "anti_designer_toggle":
+        anti_designer.toggle(DB)
+        await query.message.edit_reply_markup(anti_designer.get_sub_menu(DB))
+        return
+
+    if data == "anti_designer_set_msg":
+        PENDING_ADD[user_id] = {"state": "awaiting_anti_designer_msg"}
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_add")]])
+        text = (
+            "💬 **تعيين رسالة الحذف للمصممين**\n\n"
+            "أرسل الآن الرسالة (نص أو ملف مع نص).\n"
+            "💡 يمكنك استخدام الخط **العريض**، الاقتباس، وأي إيموجي مميز براحتك.\n"
+            "🔑 اكتب كلمة `اشارة` (أو إشارة) في أي مكان بالرسالة، وسيقوم البوت باستبدالها بمنشن للعضو!"
+        )
+        await query.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+        return
+    
+
+
+
+    # --- إضافة كلمة ممنوعة جديدة ---
+    if data == "anti_designer_add_kw":
+        PENDING_ADD[user_id] = {"state": "awaiting_anti_designer_kw"}
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="anti_designer_menu")]])
+        await query.message.reply_text("🚫 أرسل الكلمة التي تريد منع وجودها في أسماء الأعضاء:", reply_markup=kb)
+        return
+
+    # --- عرض الكلمات لحذفها ---
+    if data == "anti_designer_show_kw":
+        keywords = anti_designer.get_keywords(DB)
+        if not keywords:
+            await query.answer("لا توجد كلمات ممنوعة حالياً", show_alert=True)
+            return
+        
+        buttons = []
+        for kw in keywords:
+            buttons.append([InlineKeyboardButton(f"🗑 {kw}", callback_data=f"anti_designer_del_kw|{kw}")])
+        buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="anti_designer_menu")])
+        
+        await query.message.edit_text("إليك الكلمات الممنوعة حالياً، اضغط على الكلمة لحذفها:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    # --- تنفيذ حذف الكلمة ---
+    if data.startswith("anti_designer_del_kw|"):
+        kw_to_del = data.split("|")[1]
+        anti_designer.remove_keyword(DB, kw_to_del)
+        await query.answer(f"تم حذف {kw_to_del}")
+        await callback_router(update, context)
+        return
+    
+    
 
     # =========================================================
     # Helpers: token -> keyword (مع توافق للأزرار القديمة)
@@ -1277,33 +1366,15 @@ def main():
     init_db()
     load_cache()
     app = ApplicationBuilder().token(TOKEN).build()
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats))
-    
-    # ==== 1. أوامر الرفع والتنزيل (حطيناها فوق عشان تشتغل صح) ====
-    app.add_handler(MessageHandler(filters.Regex(r"^(رفع مشرف بوت|/promote)\s*$"), promote_user))
-    app.add_handler(MessageHandler(filters.Regex(r"^(تنزيل مشرف بوت|إزالة مشرف بوت|/demote)\s*$"), demote_user))
-
     app.add_handler(ChatMemberHandler(member_update, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(callback_router))
-    
-    # ==== 2. معالج الردود التلقائية العادي ====
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, message_handler))
-    
-    # === 3. أوامر الهمسة والإنلاين (مسحنا التكرار) ===
-    app.add_handler(MessageHandler(filters.Regex(r"^همسة "), handle_whisper), group=2)
-    app.add_handler(CallbackQueryHandler(whisper_callback, pattern=r"^wsp\|"))
-    app.add_handler(InlineQueryHandler(inline_whisper))
-    
-    # === 4. فلتر حذف الحروف (للمشرفين) ===
-    app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, delete_admin_chars), group=1)
-    
     logging.info("--> Bot started")
-    # السطر ده لازم دايماً يكون آخر سطر في الدالة!
     app.run_polling()
 
 if __name__ == "__main__":
