@@ -7,17 +7,13 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-def init_db(db_path):
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("INSERT OR IGNORE INTO settings VALUES ('anti_designer_enabled', '0')")
-        default_data = json.dumps({"html": "", "file_id": None})
-        conn.execute("INSERT OR IGNORE INTO settings VALUES ('anti_designer_data', ?)", (default_data,))
-        # إنشاء جدول الكلمات الممنوعة في الأسماء
-        conn.execute("CREATE TABLE IF NOT EXISTS anti_designer_keywords (word TEXT PRIMARY KEY)")
-        # إضافة الكلمة الافتراضية
-        conn.execute("INSERT OR IGNORE INTO anti_designer_keywords VALUES ('مصمم')")
-        conn.execute("INSERT OR IGNORE INTO anti_designer_keywords VALUES ('مصممة')")
-        conn.commit()
+def init_db(conn):  # بدل db_path
+    conn.execute("INSERT OR IGNORE INTO settings VALUES ('anti_designer_enabled', '0')")
+    default_data = json.dumps({"html": "", "file_id": None})
+    conn.execute("INSERT OR IGNORE INTO settings VALUES ('anti_designer_data', ?)", (default_data,))
+    conn.execute("CREATE TABLE IF NOT EXISTS anti_designer_keywords (word TEXT PRIMARY KEY)")
+    conn.execute("INSERT OR IGNORE INTO anti_designer_keywords VALUES ('مصمم')")
+    conn.execute("INSERT OR IGNORE INTO anti_designer_keywords VALUES ('مصممة')")
 
 def is_enabled(db_path):
     with sqlite3.connect(db_path) as conn:
