@@ -310,7 +310,8 @@ def panel_keyboard():
     )
 
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚫 منع ترويج الأسماء", callback_data="anti_designer_menu")], # 👈 الزر الجديد الخاص بالميزة
+        [InlineKeyboardButton("🚫 منع ترويج الأسماء", callback_data="anti_designer_menu")],
+        [InlineKeyboardButton("🎨 إعدادات المعاينة", callback_data="preview_settings_menu")],
         [toggle_bot_btn],
         [delete_admin_btn],
         [InlineKeyboardButton("🔄 تحديث المشرفين", callback_data="refresh_admins")],
@@ -747,6 +748,33 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         load_cache()
         PENDING_ADD.pop(user_id, None)
         await message.reply_text(f"✅ تم تغيير الكلمة من {old_kw} إلى {new_kw}")
+        return
+
+    # =========================
+    # 🎨 تعديل إعداد معاينة
+    # =========================
+    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_preview_value":
+        if not message.text:
+            await message.reply_text("❌ أرسل القيمة كنص")
+            return
+        field = PENDING_ADD[user_id]["field"]
+        raw   = message.text.strip()
+        from preview import (
+            set_preview_config_field, get_preview_config,
+            preview_settings_keyboard, PREVIEW_FIELD_LABELS
+        )
+        ok, err = set_preview_config_field(field, raw)
+        if not ok:
+            await message.reply_text(f"❌ قيمة غير صحيحة: {err}")
+            return
+        PENDING_ADD.pop(user_id, None)
+        cfg = get_preview_config()
+        label = PREVIEW_FIELD_LABELS.get(field, field)
+        await message.reply_text(
+            f"✅ تم تحديث **{label}**\n\n" + preview_settings_keyboard(cfg)[0],
+            reply_markup=preview_settings_keyboard(cfg)[1],
+            parse_mode="Markdown",
+        )
         return
 
     # =========================
@@ -1354,6 +1382,56 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ===============================
+    # 🎨 قائمة إعدادات المعاينة
+    # ===============================
+    if data == "preview_settings_menu":
+        from preview import get_preview_config, preview_settings_keyboard
+        cfg = get_preview_config()
+        await query.message.reply_text(
+            preview_settings_keyboard(cfg)[0],
+            reply_markup=preview_settings_keyboard(cfg)[1],
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("preview_set|"):
+        # preview_set|<field>
+        field = data.split("|", 1)[1]
+        from preview import PREVIEW_FIELD_LABELS
+        label = PREVIEW_FIELD_LABELS.get(field, field)
+        PENDING_ADD[user_id] = {"state": "awaiting_preview_value", "field": field}
+        hints = {
+            "bg_color":        "مثال: `0 0 0` (R G B) أو `15 15 15`",
+            "text_color":      "مثال: `255 255 255` (أبيض) أو `255 200 0` (ذهبي)",
+            "watermark_color": "مثال: `130 130 130` (رمادي)",
+            "watermark_text":  "مثال: `@YourBot`",
+            "font_size":       "مثال: `80` — رقم بين 20 و 200",
+            "watermark_font_size": "مثال: `24` — رقم بين 10 و 60",
+            "image_width":     "مثال: `1200`",
+            "image_height":    "مثال: `600`",
+        }
+        hint = hints.get(field, "أرسل القيمة الجديدة")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_add")]])
+        await query.message.reply_text(
+            f"✏️ **{label}**\n{hint}\n_(أرسل /cancel للإلغاء)_",
+            reply_markup=kb,
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "preview_reset":
+        from preview import reset_preview_config
+        reset_preview_config()
+        from preview import get_preview_config, preview_settings_keyboard
+        cfg = get_preview_config()
+        await query.message.reply_text(
+            "✅ تم إعادة الإعدادات للافتراضي\n\n" + preview_settings_keyboard(cfg)[0],
+            reply_markup=preview_settings_keyboard(cfg)[1],
+            parse_mode="Markdown",
+        )
+        return
+
+    # ===============================
     # إغلاق
     # ===============================
     if data == "close":
@@ -1375,9 +1453,9 @@ def main():
     app.add_handler(ChatMemberHandler(member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, message_handler))
+    register_preview_handlers(app)   # ← ميزة معاينة الخط
     logging.info("--> Bot started")
     app.run_polling()
-    app.register_preview_handlers
 
 if __name__ == "__main__":
     main()
