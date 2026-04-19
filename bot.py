@@ -678,17 +678,88 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # ------------------------------------------------
 
-
-
     # --- استقبال الكلمة الممنوعة الجديدة في الخاص ---
     if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_anti_designer_kw":
         if update.effective_chat.type != "private" or not update.message.text:
             return
-        
         new_kw = update.message.text.strip()
         anti_designer.add_keyword(DB, new_kw)
         PENDING_ADD.pop(user_id, None)
         await update.message.reply_text(f"✅ تم إضافة كلمة «{new_kw}» لقائمة المنع بنجاح.")
+        return
+
+    # =========================
+    # 🎨 معاينة — خطوة 2: استقبال النص (في الخاص)
+    # =========================
+    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_preview_text":
+        if not message.text:
+            await message.reply_text("❌ أرسل النص كرسالة نصية")
+            return
+        text = message.text.strip()
+        if len(text) > 200:
+            text = text[:200]
+            await message.reply_text("⚠️ تم اقتصار النص على 200 حرف.")
+        PENDING_ADD[user_id] = {"state": "awaiting_preview_font", "text": text}
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_add")]])
+        await message.reply_text("🔤 الآن أرسل ملف الخط (.ttf أو .otf):", reply_markup=kb)
+        return
+
+    # =========================
+    # 🎨 معاينة — خطوة 3: استقبال ملف الخط (في الخاص)
+    # =========================
+    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_preview_font":
+        if not message.document or not message.document.file_name.lower().endswith((".ttf", ".otf")):
+            await message.reply_text("⚠️ أرسل ملف خط بصيغة **.ttf** أو **.otf** فقط.", parse_mode="Markdown")
+            return
+        preview_text = PENDING_ADD.pop(user_id)["text"]
+        processing   = await message.reply_text("⏳ جاري توليد المعاينة...")
+        os.makedirs("temp_fonts", exist_ok=True)
+        font_path = os.path.join("temp_fonts", f"{user_id}_{message.document.file_name}")
+        try:
+            font_file = await message.document.get_file()
+            await font_file.download_to_drive(font_path)
+        except Exception as e:
+            await processing.edit_text(f"❌ فشل تنزيل الخط: {e}")
+            return
+        try:
+            loop      = asyncio.get_event_loop()
+            image_buf = await loop.run_in_executor(None, preview_module.build_preview_image, preview_text, font_path)
+        except Exception as e:
+            await processing.edit_text(f"❌ فشل توليد الصورة: {e}")
+            preview_module.cleanup_font(font_path)
+            return
+        cfg     = preview_module.get_preview_config()
+        caption = (
+            f"🖼 *معاينة الخط:* `{message.document.file_name}`\n"
+            f"📝 *النص:* {preview_text[:80]}{'...' if len(preview_text) > 80 else ''}\n"
+            f"🎨 خلفية: `{cfg['bg_color']}` | نص: `{cfg['text_color']}`"
+        )
+        try:
+            await message.reply_photo(photo=image_buf, caption=caption, parse_mode="Markdown")
+            await processing.delete()
+        except Exception as e:
+            await processing.edit_text(f"❌ فشل إرسال الصورة: {e}")
+        finally:
+            preview_module.cleanup_font(font_path)
+        return
+
+    # =========================
+    # 🎨 تعديل إعداد معاينة من لوحة التحكم
+    # =========================
+    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_preview_value":
+        if not message.text:
+            await message.reply_text("❌ أرسل القيمة كنص")
+            return
+        field = PENDING_ADD[user_id]["field"]
+        ok, err = preview_module.set_preview_config_field(field, message.text.strip())
+        if not ok:
+            await message.reply_text(f"❌ قيمة غير صحيحة: {err}", parse_mode="Markdown")
+            return
+        PENDING_ADD.pop(user_id, None)
+        cfg     = preview_module.get_preview_config()
+        label   = preview_module.PREVIEW_FIELD_LABELS.get(field, field)
+        txt, kb = preview_module.preview_settings_keyboard(cfg)
+        await message.reply_text(f"✅ تم تحديث *{label}*\n\n{txt}", reply_markup=kb, parse_mode="Markdown")
         return
     
 
@@ -910,84 +981,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             PENDING_ADD.pop(user_id, None)
             await message.reply_text("✅ تم استيراد البيانات بنجاح.")
             return             
-
-    # =========================
-    # 🎨 معاينة الخط — خطوة 3: استقبال ملف الخط
-    # =========================
-    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_preview_font":
-        if not message.document or not message.document.file_name.lower().endswith((".ttf", ".otf")):
-            await message.reply_text("⚠️ أرسل ملف خط بصيغة **.ttf** أو **.otf** فقط.", parse_mode="Markdown")
-            return
-
-        preview_text = PENDING_ADD.pop(user_id)["text"]
-        processing   = await message.reply_text("⏳ جاري توليد المعاينة...")
-
-        os.makedirs("temp_fonts", exist_ok=True)
-        font_path = os.path.join("temp_fonts", f"{user_id}_{message.document.file_name}")
-        try:
-            font_file = await message.document.get_file()
-            await font_file.download_to_drive(font_path)
-        except Exception as e:
-            await processing.edit_text(f"❌ فشل تنزيل الخط: {e}")
-            return
-
-        try:
-            loop      = asyncio.get_event_loop()
-            image_buf = await loop.run_in_executor(None, preview_module.build_preview_image, preview_text, font_path)
-        except Exception as e:
-            await processing.edit_text(f"❌ فشل توليد الصورة: {e}")
-            preview_module.cleanup_font(font_path)
-            return
-
-        cfg     = preview_module.get_preview_config()
-        caption = (
-            f"🖼 *معاينة الخط:* `{message.document.file_name}`\n"
-            f"📝 *النص:* {preview_text[:80]}{'...' if len(preview_text) > 80 else ''}\n"
-            f"🎨 خلفية: `{cfg['bg_color']}` | نص: `{cfg['text_color']}`"
-        )
-        try:
-            await message.reply_photo(photo=image_buf, caption=caption, parse_mode="Markdown")
-            await processing.delete()
-        except Exception as e:
-            await processing.edit_text(f"❌ فشل إرسال الصورة: {e}")
-        finally:
-            preview_module.cleanup_font(font_path)
-        return
-
-    # =========================
-    # 🎨 معاينة الخط — خطوة 2: استقبال النص
-    # =========================
-    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_preview_text":
-        if not message.text:
-            await message.reply_text("❌ أرسل النص كرسالة نصية")
-            return
-        text = message.text.strip()
-        if len(text) > 200:
-            text = text[:200]
-            await message.reply_text("⚠️ تم اقتصار النص على 200 حرف.")
-        PENDING_ADD[user_id] = {"state": "awaiting_preview_font", "text": text}
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_add")]])
-        await message.reply_text("🔤 الآن أرسل ملف الخط (.ttf أو .otf):", reply_markup=kb)
-        return
-
-    # =========================
-    # 🎨 تعديل إعداد معاينة من لوحة التحكم
-    # =========================
-    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_preview_value":
-        if not message.text:
-            await message.reply_text("❌ أرسل القيمة كنص")
-            return
-        field = PENDING_ADD[user_id]["field"]
-        ok, err = preview_module.set_preview_config_field(field, message.text.strip())
-        if not ok:
-            await message.reply_text(f"❌ قيمة غير صحيحة: {err}", parse_mode="Markdown")
-            return
-        PENDING_ADD.pop(user_id, None)
-        cfg   = preview_module.get_preview_config()
-        label = preview_module.PREVIEW_FIELD_LABELS.get(field, field)
-        txt, kb = preview_module.preview_settings_keyboard(cfg)
-        await message.reply_text(f"✅ تم تحديث *{label}*\n\n{txt}", reply_markup=kb, parse_mode="Markdown")
-        return
 
     # =========================
     # 🤖 الرد التلقائي
