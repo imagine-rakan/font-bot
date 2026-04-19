@@ -29,7 +29,6 @@ from telegram.ext import (
 )
 import anti_designer
 from preview import register_preview_handlers
-register_preview_handlers(app)   # ← ميزة معاينة الخط
 PANEL_SESSIONS = {}   # user_id -> chat_id الذي جاء منه
 # ==== إصلاح ترميز ويندوز ====
 sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -1378,6 +1377,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, message_handler))
     logging.info("--> Bot started")
     app.run_polling()
+    app.register_preview_handlers
 
 if __name__ == "__main__":
     main()
