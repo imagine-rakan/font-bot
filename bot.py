@@ -28,6 +28,7 @@ from telegram.ext import (
     CallbackQueryHandler, MessageHandler, ChatMemberHandler, filters
 )
 import anti_designer
+from preview import register_preview_handlers
 PANEL_SESSIONS = {}   # user_id -> chat_id الذي جاء منه
 # ==== إصلاح ترميز ويندوز ====
 sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
