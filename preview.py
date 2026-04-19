@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 preview.py — ميزة معاينة الخط
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -5,24 +6,23 @@ preview.py — ميزة معاينة الخط
   1. رُدّ على رسالة شخص بكلمة: معاينة
   2. أرسل النص المطلوب
   3. أرسل ملف الخط (.ttf / .otf)
-  → سيتم توليد صورة بالنص والخط مع دعم كامل للعربية وRTL
-
-الإعدادات الافتراضية (قابلة للتعديل في CONFIG أدناه):
-  - لون النص       : أبيض
-  - لون الخلفية    : أسود
-  - العلامة المائية: @YourBot
+  → يتم توليد صورة بالنص والخط مع دعم كامل للعربية وRTL
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os
 import io
 import asyncio
-import textwrap
-from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
-from pyrogram import Client, filters
-from pyrogram.types import Message
+from telegram import Update, Message
+from telegram.ext import (
+    ContextTypes,
+    MessageHandler,
+    filters,
+    ConversationHandler,
+    CommandHandler,
+)
 
 try:
     from bidi.algorithm import get_display
@@ -36,51 +36,36 @@ try:
 except ImportError:
     RESHAPER_AVAILABLE = False
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #        ⚙️  الإعدادات
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CONFIG = {
-    # أبعاد الصورة
-    "image_width": 1200,
-    "image_height": 600,
-
-    # الألوان (R, G, B) أو اسم اللون
-    "bg_color": (15, 15, 15),          # لون الخلفية
-    "text_color": (255, 255, 255),      # لون النص الرئيسي
-    "watermark_color": (120, 120, 120), # لون العلامة المائية
-
-    # حجم الخط
-    "font_size": 72,
-    "watermark_font_size": 22,
-
-    # العلامة المائية (غيّر النص هنا)
-    "watermark_text": "@YourBot",
-
-    # الحشو (padding) من الحواف
-    "padding": 60,
-
-    # الحد الأقصى لعدد أحرف النص المعروض
-    "max_text_length": 200,
-
-    # مسار خط احتياطي للعلامة المائية (فارغ = خط النظام)
-    "fallback_font_path": "",
-
-    # مجلد مؤقت لتخزين ملفات الخطوط
-    "temp_dir": "temp_fonts",
+    "image_width":          1200,
+    "image_height":         600,
+    "bg_color":             (15, 15, 15),           # لون الخلفية
+    "text_color":           (255, 255, 255),         # لون النص
+    "watermark_color":      (130, 130, 130),         # لون العلامة المائية
+    "font_size":            80,
+    "watermark_font_size":  24,
+    "watermark_text":       "@YourBot",              # ← غيّر اسم البوت هنا
+    "padding":              70,
+    "max_text_length":      200,
+    "temp_dir":             "temp_fonts",
 }
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#     حالات المحادثة (State)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# pending_preview[user_id] = {"step": "text"|"font", "text": str, "replied_msg": Message}
-pending_preview: dict = {}
+# حالات المحادثة
+WAIT_TEXT, WAIT_FONT = range(2)
+
+# مخزن مؤقت: user_id -> نص المعاينة
+_pending_text: dict[int, str] = {}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #        🔧  دوال مساعدة
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def prepare_arabic_text(text: str) -> str:
+def _prepare_arabic(text: str) -> str:
     """إعادة تشكيل النص العربي ودعم RTL."""
     if RESHAPER_AVAILABLE:
         text = arabic_reshaper.reshape(text)
@@ -89,270 +74,209 @@ def prepare_arabic_text(text: str) -> str:
     return text
 
 
-def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-    """تقسيم النص إلى أسطر بحيث لا يتجاوز عرض الصورة."""
+def _wrap_lines(text: str, font: ImageFont.FreeTypeFont, max_w: int) -> list[str]:
+    """تقسيم النص إلى أسطر لا تتجاوز max_w بكسل."""
     lines = []
-    # تقسيم أولي على سطور المستخدم
-    for paragraph in text.split("\n"):
-        if not paragraph.strip():
+    for para in text.split("\n"):
+        if not para.strip():
             lines.append("")
             continue
-        words = paragraph.split()
-        current_line = ""
+        words, cur = para.split(), ""
         for word in words:
-            test_line = f"{current_line} {word}".strip()
-            bbox = font.getbbox(test_line)
-            w = bbox[2] - bbox[0]
-            if w <= max_width:
-                current_line = test_line
+            test = f"{cur} {word}".strip()
+            w = font.getbbox(test)[2] - font.getbbox(test)[0]
+            if w <= max_w:
+                cur = test
             else:
-                if current_line:
-                    lines.append(current_line)
-                current_line = word
-        if current_line:
-            lines.append(current_line)
-    return lines
+                if cur:
+                    lines.append(cur)
+                cur = word
+        if cur:
+            lines.append(cur)
+    return lines or [""]
 
 
-def generate_preview_image(
-    text: str,
-    font_path: str,
-    cfg: dict = CONFIG,
-) -> io.BytesIO:
+def _build_image(text: str, font_path: str) -> io.BytesIO:
     """توليد صورة المعاينة وإرجاعها كـ BytesIO."""
+    cfg = CONFIG
+    W, H, PAD = cfg["image_width"], cfg["image_height"], cfg["padding"]
 
-    W = cfg["image_width"]
-    H = cfg["image_height"]
-    padding = cfg["padding"]
-
-    # --- إنشاء الصورة ---
-    img = Image.new("RGB", (W, H), color=cfg["bg_color"])
+    img  = Image.new("RGB", (W, H), cfg["bg_color"])
     draw = ImageDraw.Draw(img)
 
-    # --- تحميل الخط ---
+    # ── تحميل الخطوط ──
     try:
-        font = ImageFont.truetype(font_path, cfg["font_size"])
+        main_font = ImageFont.truetype(font_path, cfg["font_size"])
     except Exception:
-        font = ImageFont.load_default()
+        main_font = ImageFont.load_default()
 
-    # --- تحميل خط العلامة المائية ---
-    wm_font_path = cfg.get("fallback_font_path") or font_path
     try:
-        wm_font = ImageFont.truetype(wm_font_path, cfg["watermark_font_size"])
+        wm_font = ImageFont.truetype(font_path, cfg["watermark_font_size"])
     except Exception:
         wm_font = ImageFont.load_default()
 
-    # --- معالجة النص العربي ---
-    display_text = prepare_arabic_text(text)
+    # ── تجهيز النص ──
+    display = _prepare_arabic(text)
+    lines   = _wrap_lines(display, main_font, W - PAD * 2)
 
-    # --- تقسيم النص إلى أسطر ---
-    max_text_width = W - padding * 2
-    lines = wrap_text(display_text, font, max_text_width)
+    # ── حساب الارتفاع الكلي ──
+    gap = 12
+    heights = [main_font.getbbox(l or " ")[3] - main_font.getbbox(l or " ")[1] for l in lines]
+    total_h = sum(heights) + gap * (len(lines) - 1)
 
-    # --- حساب الارتفاع الكلي للنص ---
-    line_spacing = 10
-    line_heights = []
-    for line in lines:
-        bbox = font.getbbox(line if line else " ")
-        line_heights.append(bbox[3] - bbox[1])
-    total_text_height = sum(line_heights) + line_spacing * (len(lines) - 1)
-
-    # --- رسم النص في المنتصف (RTL) ---
-    y = (H - total_text_height) // 2
+    # ── رسم النص (محاذاة يمين - RTL) ──
+    y = (H - total_h) // 2
     for i, line in enumerate(lines):
-        if not line:
-            y += line_heights[i] + line_spacing
-            continue
-        bbox = font.getbbox(line)
-        line_w = bbox[2] - bbox[0]
-        # محاذاة يمين لـ RTL
-        x = W - padding - line_w
-        draw.text((x, y), line, font=font, fill=cfg["text_color"])
-        y += line_heights[i] + line_spacing
+        if line:
+            lw = main_font.getbbox(line)[2] - main_font.getbbox(line)[0]
+            x  = W - PAD - lw                          # محاذاة يمين
+            draw.text((x, y), line, font=main_font, fill=cfg["text_color"])
+        y += heights[i] + gap
 
-    # --- رسم العلامة المائية (أسفل اليسار) ---
-    wm_text = cfg["watermark_text"]
-    wm_bbox = wm_font.getbbox(wm_text)
-    wm_w = wm_bbox[2] - wm_bbox[0]
-    wm_h = wm_bbox[3] - wm_bbox[1]
-    wm_x = padding
-    wm_y = H - padding - wm_h
-    draw.text((wm_x, wm_y), wm_text, font=wm_font, fill=cfg["watermark_color"])
+    # ── العلامة المائية (أسفل يسار) ──
+    wm   = _prepare_arabic(cfg["watermark_text"])
+    wm_b = wm_font.getbbox(wm)
+    wm_h = wm_b[3] - wm_b[1]
+    draw.text((PAD, H - PAD - wm_h), wm, font=wm_font, fill=cfg["watermark_color"])
 
-    # --- خط فاصل رفيع تحت العلامة المائية ---
-    draw.line(
-        [(padding, H - padding + 4), (W - padding, H - padding + 4)],
-        fill=cfg["watermark_color"],
-        width=1,
-    )
+    # ── خط فاصل رفيع ──
+    draw.line([(PAD, H - PAD + 6), (W - PAD, H - PAD + 6)],
+              fill=cfg["watermark_color"], width=1)
 
-    # --- تصدير كـ BytesIO ---
-    output = io.BytesIO()
-    img.save(output, format="PNG", optimize=True)
-    output.seek(0)
-    return output
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#        🤖  هاندلرات البوت
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def register_preview_handlers(app: Client):
-    """
-    تسجيل جميع هاندلرات ميزة المعاينة.
-    استدعِ هذه الدالة من الملف الرئيسي (main.py / bot.py).
-
-    مثال:
-        from preview import register_preview_handlers
-        register_preview_handlers(app)
-    """
-
-    os.makedirs(CONFIG["temp_dir"], exist_ok=True)
-
-    # ── الخطوة 0: تفعيل الميزة بكلمة "معاينة" ──────────────────────────
-    @app.on_message(
-        filters.text
-        & filters.reply
-        & filters.create(lambda _, __, m: m.text and m.text.strip() == "معاينة")
-    )
-    async def cmd_preview(client: Client, message: Message):
-        user_id = message.from_user.id
-
-        # تجاهل أي جلسة سابقة
-        pending_preview[user_id] = {
-            "step": "text",
-            "replied_msg": message.reply_to_message,
-            "text": None,
-        }
-
-        await message.reply_text(
-            "✏️ **أرسل النص الذي تريد معاينته:**\n"
-            "_(يمكنك إلغاء العملية بإرسال /cancel)_",
-            quote=True,
-        )
-
-    # ── الخطوة 1: استقبال النص ──────────────────────────────────────────
-    @app.on_message(
-        filters.text
-        & filters.create(
-            lambda _, __, m: (
-                m.from_user
-                and m.from_user.id in pending_preview
-                and pending_preview[m.from_user.id].get("step") == "text"
-            )
-        )
-    )
-    async def receive_text(client: Client, message: Message):
-        user_id = message.from_user.id
-        text = message.text.strip()
-
-        # أمر الإلغاء
-        if text.lower() in ("/cancel", "إلغاء"):
-            pending_preview.pop(user_id, None)
-            await message.reply_text("❌ تم إلغاء عملية المعاينة.")
-            return
-
-        # تقليص النص إذا تجاوز الحد
-        if len(text) > CONFIG["max_text_length"]:
-            text = text[: CONFIG["max_text_length"]]
-            await message.reply_text(
-                f"⚠️ النص طويل جداً، سيتم اقتصاره على {CONFIG['max_text_length']} حرف."
-            )
-
-        pending_preview[user_id]["text"] = text
-        pending_preview[user_id]["step"] = "font"
-
-        await message.reply_text(
-            "🔤 **الآن أرسل ملف الخط** (.ttf أو .otf):\n"
-            "_(أو أرسل /cancel للإلغاء)_",
-            quote=True,
-        )
-
-    # ── الخطوة 2: استقبال ملف الخط وتوليد الصورة ───────────────────────
-    @app.on_message(
-        filters.document
-        & filters.create(
-            lambda _, __, m: (
-                m.from_user
-                and m.from_user.id in pending_preview
-                and pending_preview[m.from_user.id].get("step") == "font"
-            )
-        )
-    )
-    async def receive_font(client: Client, message: Message):
-        user_id = message.from_user.id
-        doc = message.document
-
-        # التحقق من امتداد الملف
-        if not doc.file_name or not doc.file_name.lower().endswith((".ttf", ".otf")):
-            await message.reply_text(
-                "⚠️ الرجاء إرسال ملف خط بصيغة **.ttf** أو **.otf** فقط."
-            )
-            return
-
-        state = pending_preview.pop(user_id, {})
-        preview_text = state.get("text", "نموذج نص عربي")
-
-        processing_msg = await message.reply_text("⏳ جاري توليد المعاينة...")
-
-        # تنزيل الخط مؤقتاً
-        font_path = os.path.join(CONFIG["temp_dir"], f"{user_id}_{doc.file_name}")
-        try:
-            await client.download_media(message, file_name=font_path)
-        except Exception as e:
-            await processing_msg.edit_text(f"❌ فشل تنزيل الخط: {e}")
-            return
-
-        # توليد الصورة
-        try:
-            image_bytes = await asyncio.get_event_loop().run_in_executor(
-                None,
-                generate_preview_image,
-                preview_text,
-                font_path,
-                CONFIG,
-            )
-        except Exception as e:
-            await processing_msg.edit_text(f"❌ فشل توليد الصورة: {e}")
-            _cleanup(font_path)
-            return
-
-        # إرسال الصورة
-        caption = (
-            f"🖼 **معاينة الخط:** `{doc.file_name}`\n"
-            f"📝 **النص:** {preview_text[:80]}{'...' if len(preview_text) > 80 else ''}"
-        )
-
-        try:
-            await message.reply_photo(
-                photo=image_bytes,
-                caption=caption,
-                quote=True,
-            )
-            await processing_msg.delete()
-        except Exception as e:
-            await processing_msg.edit_text(f"❌ فشل إرسال الصورة: {e}")
-        finally:
-            _cleanup(font_path)
-
-    # ── معالجة /cancel في أي وقت ────────────────────────────────────────
-    @app.on_message(
-        filters.command("cancel")
-        & filters.create(lambda _, __, m: m.from_user and m.from_user.id in pending_preview)
-    )
-    async def cancel_preview(client: Client, message: Message):
-        pending_preview.pop(message.from_user.id, None)
-        await message.reply_text("❌ تم إلغاء عملية المعاينة.")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#        🛠  دوال داخلية
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _cleanup(path: str):
-    """حذف الملف المؤقت."""
     try:
         if os.path.exists(path):
             os.remove(path)
     except Exception:
         pass
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#     🤖  هاندلرات المحادثة
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def _trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الخطوة 0 — اكتشاف كلمة 'معاينة' في رد على رسالة."""
+    msg: Message = update.message
+    if not msg or not msg.reply_to_message:
+        return ConversationHandler.END
+
+    await msg.reply_text(
+        "✏️ أرسل النص الذي تريد معاينته:\n_(أرسل /cancel للإلغاء)_",
+        parse_mode="Markdown",
+    )
+    return WAIT_TEXT
+
+
+async def _receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الخطوة 1 — استقبال النص."""
+    uid  = update.effective_user.id
+    text = update.message.text.strip()
+
+    if len(text) > CONFIG["max_text_length"]:
+        text = text[:CONFIG["max_text_length"]]
+        await update.message.reply_text(
+            f"⚠️ تم اقتصار النص على {CONFIG['max_text_length']} حرف."
+        )
+
+    _pending_text[uid] = text
+    await update.message.reply_text(
+        "🔤 أرسل الآن ملف الخط (.ttf أو .otf):\n_(أرسل /cancel للإلغاء)_",
+        parse_mode="Markdown",
+    )
+    return WAIT_FONT
+
+
+async def _receive_font(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الخطوة 2 — استقبال ملف الخط وتوليد الصورة."""
+    uid = update.effective_user.id
+    doc = update.message.document
+
+    if not doc or not doc.file_name.lower().endswith((".ttf", ".otf")):
+        await update.message.reply_text(
+            "⚠️ الرجاء إرسال ملف خط بصيغة **.ttf** أو **.otf** فقط.",
+            parse_mode="Markdown",
+        )
+        return WAIT_FONT          # نبقى في نفس الخطوة
+
+    preview_text = _pending_text.pop(uid, "نموذج نص عربي")
+    processing   = await update.message.reply_text("⏳ جاري توليد المعاينة...")
+
+    # تنزيل الخط
+    os.makedirs(CONFIG["temp_dir"], exist_ok=True)
+    font_path = os.path.join(CONFIG["temp_dir"], f"{uid}_{doc.file_name}")
+    try:
+        file_obj = await context.bot.get_file(doc.file_id)
+        await file_obj.download_to_drive(font_path)
+    except Exception as e:
+        await processing.edit_text(f"❌ فشل تنزيل الخط: {e}")
+        return ConversationHandler.END
+
+    # توليد الصورة في thread منفصل (لا يعطّل البوت)
+    try:
+        loop      = asyncio.get_event_loop()
+        image_buf = await loop.run_in_executor(None, _build_image, preview_text, font_path)
+    except Exception as e:
+        await processing.edit_text(f"❌ فشل توليد الصورة: {e}")
+        _cleanup(font_path)
+        return ConversationHandler.END
+
+    caption = (
+        f"🖼 **معاينة الخط:** `{doc.file_name}`\n"
+        f"📝 **النص:** {preview_text[:80]}{'...' if len(preview_text) > 80 else ''}"
+    )
+
+    try:
+        await update.message.reply_photo(photo=image_buf, caption=caption, parse_mode="Markdown")
+        await processing.delete()
+    except Exception as e:
+        await processing.edit_text(f"❌ فشل إرسال الصورة: {e}")
+    finally:
+        _cleanup(font_path)
+
+    return ConversationHandler.END
+
+
+async def _cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إلغاء العملية في أي خطوة."""
+    _pending_text.pop(update.effective_user.id, None)
+    await update.message.reply_text("❌ تم إلغاء معاينة الخط.")
+    return ConversationHandler.END
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#   📌  دالة التسجيل (تُستدعى من bot.py)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def register_preview_handlers(app):
+    """
+    سجّل هاندلرات المعاينة في كائن Application.
+    استدعِها قبل app.run_polling() في main().
+    """
+    conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(
+                filters.TEXT & filters.REPLY &
+                filters.Regex(r"^معاينة$"),
+                _trigger,
+            )
+        ],
+        states={
+            WAIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _receive_text)],
+            WAIT_FONT: [MessageHandler(filters.Document.ALL, _receive_font)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", _cancel),
+            MessageHandler(filters.COMMAND, _cancel),
+        ],
+        per_user=True,
+        per_chat=False,          # يعمل في الخاص والمجموعات
+        allow_reentry=True,
+    )
+    app.add_handler(conv)
