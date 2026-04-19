@@ -1,15 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 preview.py — ميزة معاينة الخط
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-طريقة الاستخدام:
-  1. رُدّ على رسالة شخص بكلمة: معاينة
-  2. أرسل النص المطلوب
-  3. أرسل ملف الخط (.ttf / .otf)
-  → يتم توليد صورة بالنص والخط مع دعم كامل للعربية وRTL
-
-الإعدادات: تُعدَّل من لوحة التحكم زر 🎨 إعدادات المعاينة
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+لا يحتوي على هاندلرات خاصة به — يعمل عبر PENDING_ADD في bot.py
+الإعدادات تُحفظ في bot.db وتُعدَّل من لوحة التحكم
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os
@@ -18,14 +13,7 @@ import sqlite3
 import asyncio
 
 from PIL import Image, ImageDraw, ImageFont
-from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ContextTypes,
-    MessageHandler,
-    filters,
-    ConversationHandler,
-    CommandHandler,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 try:
     from bidi.algorithm import get_display
@@ -41,62 +29,57 @@ except ImportError:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#   قاعدة البيانات (نفس ملف bot.db)
+#   الإعدادات الافتراضية
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DB = "bot.db"
 
-# الإعدادات الافتراضية
 _DEFAULTS = {
-    "bg_color":             "15 15 15",
-    "text_color":           "255 255 255",
-    "watermark_color":      "130 130 130",
-    "watermark_text":       "@YourBot",
-    "font_size":            "80",
-    "watermark_font_size":  "24",
-    "image_width":          "1200",
-    "image_height":         "600",
+    "bg_color":            "15 15 15",
+    "text_color":          "255 255 255",
+    "watermark_color":     "130 130 130",
+    "watermark_text":      "@YourBot",
+    "font_size":           "80",
+    "watermark_font_size": "24",
+    "image_width":         "1200",
+    "image_height":        "600",
 }
 
-# أسماء الحقول بالعربي
 PREVIEW_FIELD_LABELS = {
-    "bg_color":             "لون الخلفية (RGB)",
-    "text_color":           "لون النص (RGB)",
-    "watermark_color":      "لون العلامة المائية (RGB)",
-    "watermark_text":       "نص العلامة المائية",
-    "font_size":            "حجم الخط",
-    "watermark_font_size":  "حجم خط العلامة المائية",
-    "image_width":          "عرض الصورة (بكسل)",
-    "image_height":         "ارتفاع الصورة (بكسل)",
+    "bg_color":            "لون الخلفية (RGB)",
+    "text_color":          "لون النص (RGB)",
+    "watermark_color":     "لون العلامة المائية (RGB)",
+    "watermark_text":      "نص العلامة المائية",
+    "font_size":           "حجم الخط",
+    "watermark_font_size": "حجم خط العلامة المائية",
+    "image_width":         "عرض الصورة (بكسل)",
+    "image_height":        "ارتفاع الصورة (بكسل)",
 }
 
-# حالات المحادثة
-WAIT_TEXT, WAIT_FONT = range(2)
-
-# مخزن مؤقت للنصوص
-_pending_text: dict = {}
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#   💾  دوال قاعدة البيانات
+#   قاعدة البيانات
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _ensure_table():
-    with sqlite3.connect(DB) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS preview_settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        for k, v in _DEFAULTS.items():
-            conn.execute(
-                "INSERT OR IGNORE INTO preview_settings VALUES (?, ?)", (k, v)
-            )
+def init_preview_db(conn=None):
+    """أنشئ الجدول وامله بالقيم الافتراضية — يُستدعى من init_db() في bot.py"""
+    close = False
+    if conn is None:
+        conn = sqlite3.connect(DB)
+        close = True
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS preview_settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    for k, v in _DEFAULTS.items():
+        conn.execute("INSERT OR IGNORE INTO preview_settings VALUES (?, ?)", (k, v))
+    if close:
         conn.commit()
+        conn.close()
 
 
 def get_preview_config() -> dict:
-    _ensure_table()
     with sqlite3.connect(DB) as conn:
         rows = conn.execute("SELECT key, value FROM preview_settings").fetchall()
     cfg = dict(_DEFAULTS)
@@ -105,10 +88,7 @@ def get_preview_config() -> dict:
 
 
 def set_preview_config_field(field: str, raw_value: str):
-    """
-    تحديث حقل واحد.
-    يُرجع (True, "") أو (False, رسالة_خطأ)
-    """
+    """يُرجع (True, '') أو (False, رسالة_خطأ)"""
     if field not in _DEFAULTS:
         return False, "حقل غير معروف"
 
@@ -147,18 +127,15 @@ def set_preview_config_field(field: str, raw_value: str):
         if len(raw_value) > 50:
             return False, "النص أطول من 50 حرفاً"
 
-    _ensure_table()
     with sqlite3.connect(DB) as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO preview_settings VALUES (?, ?)",
-            (field, raw_value)
+            "INSERT OR REPLACE INTO preview_settings VALUES (?, ?)", (field, raw_value)
         )
         conn.commit()
     return True, ""
 
 
 def reset_preview_config():
-    _ensure_table()
     with sqlite3.connect(DB) as conn:
         for k, v in _DEFAULTS.items():
             conn.execute(
@@ -168,24 +145,22 @@ def reset_preview_config():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#   🎛  بناء قائمة الإعدادات
+#   لوحة التحكم — قائمة الإعدادات
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _rgb_preview(raw: str) -> str:
+def _rgb_fmt(raw: str) -> str:
     parts = raw.split()
-    if len(parts) == 3:
-        return f"({', '.join(parts)})"
-    return raw
+    return f"({', '.join(parts)})" if len(parts) == 3 else raw
 
 
 def preview_settings_keyboard(cfg: dict):
-    """يُرجع (نص_الرسالة, لوحة_المفاتيح)"""
+    """يُرجع (نص_الرسالة, InlineKeyboardMarkup)"""
     text = (
         "🎨 *إعدادات المعاينة*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"🖼 الخلفية:           `{_rgb_preview(cfg['bg_color'])}`\n"
-        f"✏️ النص:               `{_rgb_preview(cfg['text_color'])}`\n"
-        f"💧 العلامة المائية:   `{_rgb_preview(cfg['watermark_color'])}`\n"
+        f"🖼 الخلفية:           `{_rgb_fmt(cfg['bg_color'])}`\n"
+        f"✏️ النص:               `{_rgb_fmt(cfg['text_color'])}`\n"
+        f"💧 العلامة المائية:   `{_rgb_fmt(cfg['watermark_color'])}`\n"
         f"📝 نص العلامة:        `{cfg['watermark_text']}`\n"
         f"🔤 حجم الخط:          `{cfg['font_size']}`\n"
         f"🔡 حجم خط العلامة:   `{cfg['watermark_font_size']}`\n"
@@ -194,7 +169,6 @@ def preview_settings_keyboard(cfg: dict):
         "━━━━━━━━━━━━━━━━━━━━\n"
         "_اضغط على أي زر لتعديله_"
     )
-
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🖼 لون الخلفية",        callback_data="preview_set|bg_color"),
@@ -213,23 +187,23 @@ def preview_settings_keyboard(cfg: dict):
             InlineKeyboardButton("📏 ارتفاع الصورة",        callback_data="preview_set|image_height"),
         ],
         [InlineKeyboardButton("🔄 إعادة الإعدادات الافتراضية", callback_data="preview_reset")],
-        [InlineKeyboardButton("❌ إغلاق",                   callback_data="close")],
+        [InlineKeyboardButton("❌ إغلاق", callback_data="close")],
     ])
     return text, kb
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#   🖼  توليد الصورة
+#   توليد الصورة
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _parse_color(raw: str) -> tuple:
+def _parse_rgb(raw: str) -> tuple:
     parts = raw.strip().split()
     if len(parts) == 3:
         return tuple(int(p) for p in parts)
     return (255, 255, 255)
 
 
-def _prepare_arabic(text: str) -> str:
+def _arabic(text: str) -> str:
     if RESHAPER_AVAILABLE:
         text = arabic_reshaper.reshape(text)
     if BIDI_AVAILABLE:
@@ -237,7 +211,7 @@ def _prepare_arabic(text: str) -> str:
     return text
 
 
-def _wrap_lines(text: str, font, max_w: int) -> list:
+def _wrap(text: str, font, max_w: int) -> list:
     lines = []
     for para in text.split("\n"):
         if not para.strip():
@@ -246,8 +220,7 @@ def _wrap_lines(text: str, font, max_w: int) -> list:
         words, cur = para.split(), ""
         for word in words:
             test = f"{cur} {word}".strip()
-            w = font.getbbox(test)[2] - font.getbbox(test)[0]
-            if w <= max_w:
+            if font.getbbox(test)[2] - font.getbbox(test)[0] <= max_w:
                 cur = test
             else:
                 if cur:
@@ -258,51 +231,47 @@ def _wrap_lines(text: str, font, max_w: int) -> list:
     return lines or [""]
 
 
-def _build_image(text: str, font_path: str) -> io.BytesIO:
-    cfg = get_preview_config()
-
+def build_preview_image(text: str, font_path: str) -> io.BytesIO:
+    cfg          = get_preview_config()
     W            = int(cfg["image_width"])
     H            = int(cfg["image_height"])
     PAD          = 70
-    bg_color     = _parse_color(cfg["bg_color"])
-    text_color   = _parse_color(cfg["text_color"])
-    wm_color     = _parse_color(cfg["watermark_color"])
-    font_size    = int(cfg["font_size"])
-    wm_font_size = int(cfg["watermark_font_size"])
+    bg           = _parse_rgb(cfg["bg_color"])
+    fg           = _parse_rgb(cfg["text_color"])
+    wm_color     = _parse_rgb(cfg["watermark_color"])
+    fsize        = int(cfg["font_size"])
+    wm_fsize     = int(cfg["watermark_font_size"])
     wm_text      = cfg["watermark_text"]
 
-    img  = Image.new("RGB", (W, H), bg_color)
+    img  = Image.new("RGB", (W, H), bg)
     draw = ImageDraw.Draw(img)
 
     try:
-        main_font = ImageFont.truetype(font_path, font_size)
+        font = ImageFont.truetype(font_path, fsize)
     except Exception:
-        main_font = ImageFont.load_default()
+        font = ImageFont.load_default()
 
     try:
-        wm_font = ImageFont.truetype(font_path, wm_font_size)
+        wm_font = ImageFont.truetype(font_path, wm_fsize)
     except Exception:
         wm_font = ImageFont.load_default()
 
-    display = _prepare_arabic(text)
-    lines   = _wrap_lines(display, main_font, W - PAD * 2)
+    display = _arabic(text)
+    lines   = _wrap(display, font, W - PAD * 2)
     gap     = 14
-    heights = [main_font.getbbox(l or " ")[3] - main_font.getbbox(l or " ")[1] for l in lines]
+    heights = [font.getbbox(l or " ")[3] - font.getbbox(l or " ")[1] for l in lines]
     total_h = sum(heights) + gap * (len(lines) - 1)
 
     y = (H - total_h) // 2
     for i, line in enumerate(lines):
         if line:
-            lw = main_font.getbbox(line)[2] - main_font.getbbox(line)[0]
-            x  = W - PAD - lw                   # RTL — محاذاة يمين
-            draw.text((x, y), line, font=main_font, fill=text_color)
+            lw = font.getbbox(line)[2] - font.getbbox(line)[0]
+            draw.text((W - PAD - lw, y), line, font=font, fill=fg)   # RTL
         y += heights[i] + gap
 
-    # العلامة المائية
-    wm_display = _prepare_arabic(wm_text)
-    wm_b = wm_font.getbbox(wm_display)
-    wm_h = wm_b[3] - wm_b[1]
-    draw.text((PAD, H - PAD - wm_h), wm_display, font=wm_font, fill=wm_color)
+    wm_d = _arabic(wm_text)
+    wm_h = wm_font.getbbox(wm_d)[3] - wm_font.getbbox(wm_d)[1]
+    draw.text((PAD, H - PAD - wm_h), wm_d, font=wm_font, fill=wm_color)
     draw.line([(PAD, H - PAD + 6), (W - PAD, H - PAD + 6)], fill=wm_color, width=1)
 
     buf = io.BytesIO()
@@ -311,128 +280,9 @@ def _build_image(text: str, font_path: str) -> io.BytesIO:
     return buf
 
 
-def _cleanup(path: str):
+def cleanup_font(path: str):
     try:
         if os.path.exists(path):
             os.remove(path)
     except Exception:
         pass
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#   🤖  هاندلرات المحادثة
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-async def _trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg: Message = update.message
-    if not msg or not msg.reply_to_message:
-        return ConversationHandler.END
-
-    await msg.reply_text(
-        "✏️ أرسل النص الذي تريد معاينته:\n_(أرسل /cancel للإلغاء)_",
-        parse_mode="Markdown",
-    )
-    return WAIT_TEXT
-
-
-async def _receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    text = update.message.text.strip()
-
-    if len(text) > 200:
-        text = text[:200]
-        await update.message.reply_text("⚠️ تم اقتصار النص على 200 حرف.")
-
-    _pending_text[uid] = text
-    await update.message.reply_text(
-        "🔤 أرسل الآن ملف الخط (.ttf أو .otf):\n_(أرسل /cancel للإلغاء)_",
-        parse_mode="Markdown",
-    )
-    return WAIT_FONT
-
-
-async def _receive_font(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    doc = update.message.document
-
-    if not doc or not doc.file_name.lower().endswith((".ttf", ".otf")):
-        await update.message.reply_text(
-            "⚠️ الرجاء إرسال ملف خط بصيغة **.ttf** أو **.otf** فقط.",
-            parse_mode="Markdown",
-        )
-        return WAIT_FONT
-
-    preview_text = _pending_text.pop(uid, "نموذج نص عربي")
-    processing   = await update.message.reply_text("⏳ جاري توليد المعاينة...")
-
-    os.makedirs("temp_fonts", exist_ok=True)
-    font_path = os.path.join("temp_fonts", f"{uid}_{doc.file_name}")
-
-    try:
-        file_obj = await context.bot.get_file(doc.file_id)
-        await file_obj.download_to_drive(font_path)
-    except Exception as e:
-        await processing.edit_text(f"❌ فشل تنزيل الخط: {e}")
-        return ConversationHandler.END
-
-    try:
-        loop      = asyncio.get_event_loop()
-        image_buf = await loop.run_in_executor(None, _build_image, preview_text, font_path)
-    except Exception as e:
-        await processing.edit_text(f"❌ فشل توليد الصورة: {e}")
-        _cleanup(font_path)
-        return ConversationHandler.END
-
-    cfg     = get_preview_config()
-    caption = (
-        f"🖼 *معاينة الخط:* `{doc.file_name}`\n"
-        f"📝 *النص:* {preview_text[:80]}{'...' if len(preview_text) > 80 else ''}\n"
-        f"🎨 خلفية: `{cfg['bg_color']}` | نص: `{cfg['text_color']}`"
-    )
-
-    try:
-        await update.message.reply_photo(
-            photo=image_buf, caption=caption, parse_mode="Markdown"
-        )
-        await processing.delete()
-    except Exception as e:
-        await processing.edit_text(f"❌ فشل إرسال الصورة: {e}")
-    finally:
-        _cleanup(font_path)
-
-    return ConversationHandler.END
-
-
-async def _cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _pending_text.pop(update.effective_user.id, None)
-    await update.message.reply_text("❌ تم إلغاء معاينة الخط.")
-    return ConversationHandler.END
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#   📌  دالة التسجيل
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def register_preview_handlers(app):
-    """سجّل هاندلرات المعاينة — استدعِها من main() في bot.py."""
-    _ensure_table()
-    conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(
-                filters.TEXT & filters.REPLY & filters.Regex(r"^معاينة$"),
-                _trigger,
-            )
-        ],
-        states={
-            WAIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _receive_text)],
-            WAIT_FONT: [MessageHandler(filters.Document.ALL, _receive_font)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", _cancel),
-            MessageHandler(filters.COMMAND, _cancel),
-        ],
-        per_user=True,
-        per_chat=False,
-        allow_reentry=True,
-    )
-    app.add_handler(conv)
