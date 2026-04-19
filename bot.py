@@ -13,6 +13,7 @@
 import hashlib
 import logging
 import os
+import asyncio
 import sqlite3
 import json
 import io
@@ -28,7 +29,7 @@ from telegram.ext import (
     CallbackQueryHandler, MessageHandler, ChatMemberHandler, filters
 )
 import anti_designer
-from preview import register_preview_handlers
+import preview as preview_module
 PANEL_SESSIONS = {}   # user_id -> chat_id الذي جاء منه
 # ==== إصلاح ترميز ويندوز ====
 sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -104,6 +105,7 @@ def init_db():
 
         # --- إضافة الجداول للميزة الجديدة ---
         anti_designer.init_db(conn)
+        preview_module.init_preview_db(conn)
 
         conn.commit()
     
@@ -311,7 +313,7 @@ def panel_keyboard():
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚫 منع ترويج الأسماء", callback_data="anti_designer_menu")],
-        [InlineKeyboardButton("🎨 إعدادات المعاينة", callback_data="preview_settings_menu")],
+        [InlineKeyboardButton("🎨 إعدادات المعاينة",  callback_data="preview_settings_menu")],
         [toggle_bot_btn],
         [delete_admin_btn],
         [InlineKeyboardButton("🔄 تحديث المشرفين", callback_data="refresh_admins")],
@@ -706,6 +708,21 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     # -----------------------------------------------------------
 
+    # =========================
+    # 🎨 معاينة الخط — خطوة 1: اكتشاف كلمة "معاينة"
+    # =========================
+    if (
+        message.text
+        and message.text.strip() == "معاينة"
+        and message.reply_to_message
+        and message.chat.type in ("group", "supergroup")
+    ):
+        if await is_admin_in_chat(user_id, message.chat.id, context):
+            PENDING_ADD[user_id] = {"state": "awaiting_preview_text"}
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_add")]])
+            await message.reply_text("✏️ أرسل النص الذي تريد معاينته:", reply_markup=kb)
+            return
+
     # (باقي أكواد إضافة الردود والرد التلقائي كما هي تماماً)
 
     # =========================
@@ -748,33 +765,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         load_cache()
         PENDING_ADD.pop(user_id, None)
         await message.reply_text(f"✅ تم تغيير الكلمة من {old_kw} إلى {new_kw}")
-        return
-
-    # =========================
-    # 🎨 تعديل إعداد معاينة
-    # =========================
-    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_preview_value":
-        if not message.text:
-            await message.reply_text("❌ أرسل القيمة كنص")
-            return
-        field = PENDING_ADD[user_id]["field"]
-        raw   = message.text.strip()
-        from preview import (
-            set_preview_config_field, get_preview_config,
-            preview_settings_keyboard, PREVIEW_FIELD_LABELS
-        )
-        ok, err = set_preview_config_field(field, raw)
-        if not ok:
-            await message.reply_text(f"❌ قيمة غير صحيحة: {err}")
-            return
-        PENDING_ADD.pop(user_id, None)
-        cfg = get_preview_config()
-        label = PREVIEW_FIELD_LABELS.get(field, field)
-        await message.reply_text(
-            f"✅ تم تحديث **{label}**\n\n" + preview_settings_keyboard(cfg)[0],
-            reply_markup=preview_settings_keyboard(cfg)[1],
-            parse_mode="Markdown",
-        )
         return
 
     # =========================
@@ -920,6 +910,84 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             PENDING_ADD.pop(user_id, None)
             await message.reply_text("✅ تم استيراد البيانات بنجاح.")
             return             
+
+    # =========================
+    # 🎨 معاينة الخط — خطوة 3: استقبال ملف الخط
+    # =========================
+    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_preview_font":
+        if not message.document or not message.document.file_name.lower().endswith((".ttf", ".otf")):
+            await message.reply_text("⚠️ أرسل ملف خط بصيغة **.ttf** أو **.otf** فقط.", parse_mode="Markdown")
+            return
+
+        preview_text = PENDING_ADD.pop(user_id)["text"]
+        processing   = await message.reply_text("⏳ جاري توليد المعاينة...")
+
+        os.makedirs("temp_fonts", exist_ok=True)
+        font_path = os.path.join("temp_fonts", f"{user_id}_{message.document.file_name}")
+        try:
+            font_file = await message.document.get_file()
+            await font_file.download_to_drive(font_path)
+        except Exception as e:
+            await processing.edit_text(f"❌ فشل تنزيل الخط: {e}")
+            return
+
+        try:
+            loop      = asyncio.get_event_loop()
+            image_buf = await loop.run_in_executor(None, preview_module.build_preview_image, preview_text, font_path)
+        except Exception as e:
+            await processing.edit_text(f"❌ فشل توليد الصورة: {e}")
+            preview_module.cleanup_font(font_path)
+            return
+
+        cfg     = preview_module.get_preview_config()
+        caption = (
+            f"🖼 *معاينة الخط:* `{message.document.file_name}`\n"
+            f"📝 *النص:* {preview_text[:80]}{'...' if len(preview_text) > 80 else ''}\n"
+            f"🎨 خلفية: `{cfg['bg_color']}` | نص: `{cfg['text_color']}`"
+        )
+        try:
+            await message.reply_photo(photo=image_buf, caption=caption, parse_mode="Markdown")
+            await processing.delete()
+        except Exception as e:
+            await processing.edit_text(f"❌ فشل إرسال الصورة: {e}")
+        finally:
+            preview_module.cleanup_font(font_path)
+        return
+
+    # =========================
+    # 🎨 معاينة الخط — خطوة 2: استقبال النص
+    # =========================
+    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_preview_text":
+        if not message.text:
+            await message.reply_text("❌ أرسل النص كرسالة نصية")
+            return
+        text = message.text.strip()
+        if len(text) > 200:
+            text = text[:200]
+            await message.reply_text("⚠️ تم اقتصار النص على 200 حرف.")
+        PENDING_ADD[user_id] = {"state": "awaiting_preview_font", "text": text}
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_add")]])
+        await message.reply_text("🔤 الآن أرسل ملف الخط (.ttf أو .otf):", reply_markup=kb)
+        return
+
+    # =========================
+    # 🎨 تعديل إعداد معاينة من لوحة التحكم
+    # =========================
+    if user_id in PENDING_ADD and PENDING_ADD[user_id].get("state") == "awaiting_preview_value":
+        if not message.text:
+            await message.reply_text("❌ أرسل القيمة كنص")
+            return
+        field = PENDING_ADD[user_id]["field"]
+        ok, err = preview_module.set_preview_config_field(field, message.text.strip())
+        if not ok:
+            await message.reply_text(f"❌ قيمة غير صحيحة: {err}", parse_mode="Markdown")
+            return
+        PENDING_ADD.pop(user_id, None)
+        cfg   = preview_module.get_preview_config()
+        label = preview_module.PREVIEW_FIELD_LABELS.get(field, field)
+        txt, kb = preview_module.preview_settings_keyboard(cfg)
+        await message.reply_text(f"✅ تم تحديث *{label}*\n\n{txt}", reply_markup=kb, parse_mode="Markdown")
+        return
 
     # =========================
     # 🤖 الرد التلقائي
@@ -1385,50 +1453,37 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🎨 قائمة إعدادات المعاينة
     # ===============================
     if data == "preview_settings_menu":
-        from preview import get_preview_config, preview_settings_keyboard
-        cfg = get_preview_config()
-        await query.message.reply_text(
-            preview_settings_keyboard(cfg)[0],
-            reply_markup=preview_settings_keyboard(cfg)[1],
-            parse_mode="Markdown",
-        )
+        cfg = preview_module.get_preview_config()
+        txt, kb = preview_module.preview_settings_keyboard(cfg)
+        await query.message.reply_text(txt, reply_markup=kb, parse_mode="Markdown")
         return
 
     if data.startswith("preview_set|"):
-        # preview_set|<field>
         field = data.split("|", 1)[1]
-        from preview import PREVIEW_FIELD_LABELS
-        label = PREVIEW_FIELD_LABELS.get(field, field)
-        PENDING_ADD[user_id] = {"state": "awaiting_preview_value", "field": field}
+        label = preview_module.PREVIEW_FIELD_LABELS.get(field, field)
         hints = {
-            "bg_color":        "مثال: `0 0 0` (R G B) أو `15 15 15`",
-            "text_color":      "مثال: `255 255 255` (أبيض) أو `255 200 0` (ذهبي)",
-            "watermark_color": "مثال: `130 130 130` (رمادي)",
-            "watermark_text":  "مثال: `@YourBot`",
-            "font_size":       "مثال: `80` — رقم بين 20 و 200",
-            "watermark_font_size": "مثال: `24` — رقم بين 10 و 60",
-            "image_width":     "مثال: `1200`",
-            "image_height":    "مثال: `600`",
+            "bg_color":            "مثال: `15 15 15` (أسود) أو `255 255 255` (أبيض)",
+            "text_color":          "مثال: `255 255 255` (أبيض) أو `255 200 0` (ذهبي)",
+            "watermark_color":     "مثال: `130 130 130` (رمادي)",
+            "watermark_text":      "مثال: `@YourBot`",
+            "font_size":           "رقم بين 20 و 200 — مثال: `80`",
+            "watermark_font_size": "رقم بين 10 و 60 — مثال: `24`",
+            "image_width":         "رقم بين 200 و 4000 — مثال: `1200`",
+            "image_height":        "رقم بين 200 و 4000 — مثال: `600`",
         }
-        hint = hints.get(field, "أرسل القيمة الجديدة")
+        PENDING_ADD[user_id] = {"state": "awaiting_preview_value", "field": field}
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel_add")]])
         await query.message.reply_text(
-            f"✏️ **{label}**\n{hint}\n_(أرسل /cancel للإلغاء)_",
-            reply_markup=kb,
-            parse_mode="Markdown",
+            f"✏️ *{label}*\n{hints.get(field, '')}\n_أرسل القيمة الجديدة:_",
+            reply_markup=kb, parse_mode="Markdown"
         )
         return
 
     if data == "preview_reset":
-        from preview import reset_preview_config
-        reset_preview_config()
-        from preview import get_preview_config, preview_settings_keyboard
-        cfg = get_preview_config()
-        await query.message.reply_text(
-            "✅ تم إعادة الإعدادات للافتراضي\n\n" + preview_settings_keyboard(cfg)[0],
-            reply_markup=preview_settings_keyboard(cfg)[1],
-            parse_mode="Markdown",
-        )
+        preview_module.reset_preview_config()
+        cfg = preview_module.get_preview_config()
+        txt, kb = preview_module.preview_settings_keyboard(cfg)
+        await query.message.reply_text("✅ تم إعادة الإعدادات الافتراضية\n\n" + txt, reply_markup=kb, parse_mode="Markdown")
         return
 
     # ===============================
@@ -1453,7 +1508,6 @@ def main():
     app.add_handler(ChatMemberHandler(member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, message_handler))
-    register_preview_handlers(app)   # ← ميزة معاينة الخط
     logging.info("--> Bot started")
     app.run_polling()
 
