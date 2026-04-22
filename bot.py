@@ -363,6 +363,14 @@ async def search_reply(
     total = (len(matched_items) - 1) // ITEMS_PER_PAGE + 1
     start, end = (page - 1) * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE
 
+    buttons = []
+    for kw, item in matched_items[start:end]:
+        preview = (
+            (item["text"][:30] + "...")
+            if item.get("text") and len(item["text"]) > 30
+            else (item.get("text") or "ملف فقط")
+        )
+
         token = kw_token(user_id, kw)
 
         buttons.append([
